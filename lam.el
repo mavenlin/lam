@@ -6,10 +6,9 @@
 ;; Author: Lin Min <mavenlin@gmail.com>
 ;; Keywords: llm, ai, lam, streaming
 ;; Version: 1.0.0
-;; Package-Requires: ((emacs "29.1"))
+;; Package-Requires: ((emacs "29.1") (polymode "0.2.2") (markdown-mode "2.4") (json-mode "1.9.2"))
 
 (require 'comint)
-(require 'pp)
 (require 'polymode)
 (require 'json)
 (require 'markdown-mode)

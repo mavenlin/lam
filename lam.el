@@ -62,6 +62,7 @@ Signals an error if `lam-key' is not configured."
   (interactive)
   ;; Validate required configuration
   (unless lam-key
+    (funcall sentinel nil "no api key")
     (error "API key is not set. Please set the variable `lam-key`"))
 
   ;; Prepare request parameters

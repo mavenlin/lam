@@ -79,6 +79,7 @@ Signals an error if `lam-key' is not configured."
                   (:stream . t))))
          ;; Build curl command arguments
          (curl-args `("-N"  ; Disable buffering for streaming
+                      "--fail"  ; Fail if the request doesn't return a response
                       "-H" ,(format "Content-Type: %s" "application/json")
                       "-H" ,(format "Authorization: Bearer %s" lam-key)
                       "-d" ,data

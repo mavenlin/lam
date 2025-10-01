@@ -30,6 +30,8 @@ Ensure this key has appropriate permissions for chat completions.")
   "Model identifier to use for LLM requests.
 This should be a valid model name supported by the configured API endpoint.")
 
+(defvar lam-auto nil "If enabled, directly execute the LLM output.")
+
 (defvar lam--system-message "You're the best agent in the world because you have access to emacs.
 You can generate emacs-lisp in backtick code blocks and annotate it with 'emacs-lisp', and it will gets executed and the result will be returned to you.
 Generate only one code block at a time."
@@ -310,7 +312,11 @@ EVENT is a string describing the end of process state."
           (let* ((end (marker-position (lam-pm)))
                  (content (buffer-substring-no-properties beg (- end 5))))
             (lam--context-push "llm" content prefix))
-          (comint-output-filter (get-buffer-process buffer) lam-prompt-internal))
+          ;; by default, fall back to the prompt line and let the user determine whether to proceed
+          ;; if auto mode is turned on, we can just proceed to the next step
+          (if lam-auto
+              (run-at-time 0 nil (lambda () (lam-proceed buffer stream)))
+            (comint-output-filter (get-buffer-process buffer) lam-prompt-internal)))
       ;; otherwise an error occurred
       ;; clean up the head and report error
       (progn
@@ -415,22 +421,33 @@ PREFIX is an optional string to append as an assistant message."
                  (last-block (car (last results)))
                  (code-type (car last-block))
                  (code-content (cadr last-block)))
-            (when (or (string= code-type "emacs-lisp") (string= code-type "elisp"))
-              ;; The following code could have changed the current buffer.
-              ;; because we don't know what the llm could be writing in the code-content.
-              ;; therefore we need switch back to the original buffer.
-              (setq ret-value
-                    (lam-eval-and-capture code-content))
+            (if (not last-block)
+                (progn
+                  (comint-output-filter (get-buffer-process base-buffer) lam-prompt-internal)
+                  (message "No fenced code block found in the last llm response"))
+              (if (or (string= code-type "emacs-lisp") (string= code-type "elisp"))
+                  ;; if llm generated emacs code block
+                  (progn
+                    ;; The following code could have changed the current buffer.
+                    ;; because we don't know what the llm could be writing in the code-content.
+                    ;; therefore we need switch back to the original buffer.
+                    (setq ret-value
+                          (lam-eval-and-capture code-content))
 
-              (with-current-buffer base-buffer
-                (let ((to-print (prin1-to-string ret-value)))
-                  (princ (format "─── %s: emacs ───" (length lam--context)) stream)
-                  (funcall stream t)
-                  (princ to-print stream)
-                  (princ "\n───" stream)
-                  (funcall stream t)
-                  (lam--context-push "emacs" to-print)
-                  (lam-proceed base-buffer stream)))))
+                    (with-current-buffer base-buffer
+                      (let ((to-print (prin1-to-string ret-value)))
+                        (princ (format "─── %s: emacs ───" (length lam--context)) stream)
+                        (funcall stream t)
+                        (princ to-print stream)
+                        (princ "\n───" stream)
+                        (funcall stream t)
+                        (lam--context-push "emacs" to-print)
+                        (run-at-time 0 nil (lambda () (lam-proceed base-buffer stream))))))
+                ;; no emacs code block
+                (progn
+                  (message "For now we only support emacs-lisp code blocks.")
+                  ;; fall back to prompt
+                  (comint-output-filter (get-buffer-process base-buffer) lam-prompt-internal)))))
         ;; else the previous step is not llm, we should send things to llm
         (progn
           (princ (format "─── %s: llm ───" (length lam--context)) stream)

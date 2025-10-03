@@ -85,7 +85,7 @@ Signals an error if `lam-key' is not configured."
                       "--fail"  ; Fail if the request doesn't return a response
                       "-H" ,(format "Content-Type: %s" "application/json")
                       "-H" ,(format "Authorization: Bearer %s" lam-key)
-                      "-d" ,data
+                      "--data-binary" "@-"
                       ,url)))
 
     ;; Log request details for debugging
@@ -96,12 +96,16 @@ Signals an error if `lam-key' is not configured."
                         (current-time-string) url model data))))
 
     ;; Start the streaming process
-    (make-process
-     :name "lam-curl"
-     :command (cons "curl" curl-args)
-     :buffer nil
-     :filter filter
-     :sentinel sentinel)))
+    (let ((process (make-process
+                    :name "lam-curl"
+                    :command (cons "curl" curl-args)
+                    :buffer nil
+                    :filter filter
+                    :sentinel sentinel
+                    :connection-type 'pipe)))
+      (process-send-string process data)
+      (process-send-eof process)
+      process)))
 
 
 ;;; local variables to store context of the user/llm/emacs interaction session

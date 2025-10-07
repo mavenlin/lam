@@ -34,13 +34,23 @@ This should be a valid model name supported by the configured API endpoint.")
 
 (defvar lam--system-message "You're the best agent in the world because you have access to emacs.
 You can generate emacs-lisp in backtick code blocks and annotate it with 'emacs-lisp', and it will gets executed and the result will be returned to you.
-Generate only one code block at a time."
+If you generate code blocks other than emacs-lisp, it will be pasted and executed in the terminal.
+Generate ONLY ONE code block at a time."
   "Buffer-local variable to store context information.")
+
+(defvar lam--tmux-session nil
+  "The tmux session name to use for terminal commands.")
+
+(defvar lam--tmux-default-pane nil
+  "The tmux default pane name to use for terminal commands.")
 
 ;;; Process and marker utilities
 
 (defvar-local lam-process nil
   "The process associated with the current lam buffer.")
+
+(defvar-local lam-active-worker nil
+  "The process associated with the current lam eval.")
 
 ;;; The function to make requests to a openai compatible api end point via curl
 
@@ -107,6 +117,20 @@ Signals an error if `lam-key' is not configured."
       (process-send-eof process)
       process)))
 
+(defun lam-stream-request-terminal (command filter sentinel)
+  "Make a terminal command request via tmux.
+COMMAND is the shell command to run in the tmux pane.
+FILTER is a function called with process and output string for handling
+streaming data.
+SENTINEL is a function called when the process changes state (e.g., finishes)."
+  (let ((process (make-process
+                  :name "lam-tmux-stream"
+                  :command `("tty-use" "stream" "-p" ,lam--tmux-default-pane ,command)
+                  :buffer nil
+                  :filter filter
+                  :sentinel sentinel)))
+    (process-send-string process command)
+    (process-send-eof process)))
 
 ;;; local variables to store context of the user/llm/emacs interaction session
 (defvar-local lam--context nil
@@ -231,9 +255,12 @@ with ROLE and CONTENT onto the context, optionally with PREFIX."
 (defun lam-send-input ()
   "Evaluate the Emacs Lisp expression after the prompt."
   (interactive)
-  (let (lam-input)                     ; set by lam-input-sender
-    (comint-send-input)                 ; update history, markers etc.
-    (lam-eval-input lam-input)))
+  (if (process-live-p lam-active-worker)
+      (progn
+        (message "A request is in progress"))
+    (let (lam-input)                     ; set by lam-input-sender
+      (comint-send-input)                 ; update history, markers etc.
+      (lam-eval-input lam-input))))
 
 ;;; Evaluation
 
@@ -273,9 +300,6 @@ nonempty, then flushes the buffer."
             (setf flush-timer (run-with-timer 0.1 nil flush-buffer))))))))
 
 
-(defvar-local lam-active-worker nil
-  "The process associated with the current lam eval.")
-
 (defun lam-llm-request-filter (stream proc string)
   "Process the streaming output from the `curl` process.
 STREAM is the buffer to use as stdout.
@@ -298,12 +322,13 @@ This function is called by Emacs whenever new data is available."
               (princ content stream))))))))
 
 ;; callback function
-(defun lam-llm-request-sentinel (buffer stream beg prefix proc event)
+(defun lam--request-sentinel (buffer stream beg prefix role proc event)
   "Handle end of llm request process.
 BUFFER is the buffer associated with llm-agent-mode.
 STREAM is the buffer to use as stdout.
 BEG is the position in BUFFER where the llm response started.
 PREFIX is an optional string to prepend as an assistant message.
+ROLE is the role of the current request, either llm or terminal.
 PROC is the process producing the output.
 EVENT is a string describing the end of process state."
   (with-current-buffer buffer
@@ -315,10 +340,10 @@ EVENT is a string describing the end of process state."
           ;; get text from beg to current pm, and add to context
           (let* ((end (marker-position (lam-pm)))
                  (content (buffer-substring-no-properties beg (- end 5))))
-            (lam--context-push "llm" content prefix))
+            (lam--context-push role content prefix))
           ;; by default, fall back to the prompt line and let the user determine whether to proceed
           ;; if auto mode is turned on, we can just proceed to the next step
-          (if lam-auto
+          (if (or lam-auto (not (string= role "llm")))
               (run-at-time 0 nil (lambda () (lam-proceed buffer stream)))
             (comint-output-filter (get-buffer-process buffer) lam-prompt-internal)))
       ;; otherwise an error occurred
@@ -339,8 +364,9 @@ EVENT is a string describing the end of process state."
             (let ((inhibit-read-only t))
               (delete-region beg (point-max)))
             (lam-set-pm (point-max))))
-        (message "LLM request error: %s" event)
-        (comint-output-filter (get-buffer-process buffer) lam-prompt-internal)))))
+        (message "%s request error: %s" role event)
+        (comint-output-filter (get-buffer-process buffer) lam-prompt-internal)))
+    (setq lam-active-worker nil)))
 
 (defun lam-parse-fenced-code-blocks (text)
   "Parse TEXT and return a list of (type content) pairs for each fenced code block.
@@ -449,9 +475,16 @@ PREFIX is an optional string to append as an assistant message."
                         (run-at-time 0 nil (lambda () (lam-proceed base-buffer stream))))))
                 ;; no emacs code block
                 (progn
-                  (message "For now we only support emacs-lisp code blocks.")
-                  ;; fall back to prompt
-                  (comint-output-filter (get-buffer-process base-buffer) lam-prompt-internal)))))
+                  (message (substring lam--tmux-default-pane 1))
+                  (princ (format "─── %s: terminal (%s) ───" (length lam--context) (substring lam--tmux-default-pane 1)) stream)
+                  (funcall stream t)
+                  (let* ((beg (marker-position (lam-pm)))
+                         (filter (lambda (proc event) (princ event stream)))
+                         (sentinel (lambda (proc event) (lam--request-sentinel base-buffer stream beg prefix "terminal" proc event))))
+                    (when (process-live-p lam-active-worker)
+                      (kill-process lam-active-worker))
+                    (setq lam-active-worker
+                          (lam-stream-request-terminal code-content filter sentinel)))))))
         ;; else the previous step is not llm, we should send things to llm
         (progn
           (princ (format "─── %s: llm ───" (length lam--context)) stream)
@@ -459,7 +492,7 @@ PREFIX is an optional string to append as an assistant message."
           (let* ((messages (lam--messages))
                  (beg (marker-position (lam-pm)))
                  (filter (lambda (proc event) (lam-llm-request-filter stream proc event)))
-                 (sentinel (lambda (proc event) (lam-llm-request-sentinel base-buffer stream beg prefix proc event))))
+                 (sentinel (lambda (proc event) (lam--request-sentinel base-buffer stream beg prefix "llm" proc event))))
             (when prefix
               (princ prefix stream))
             (when (process-live-p lam-active-worker)
@@ -589,6 +622,16 @@ Customized bindings may be defined in `lam-map', which currently contains:
   (setq-local outline-regexp "^─── [0-9]+:")
   (outline-minor-mode 1)
 
+  ;; Initialize a tmux session
+  (setq lam--tmux-session (with-temp-buffer
+                            (call-process "tty-use" nil t nil "new-session")
+                            (string-trim (buffer-string) "[ \t\n]+")))
+  (setq lam--tmux-default-pane (with-temp-buffer
+                                 (call-process "tty-use" nil t nil "list-panes" "-s" lam--tmux-session)
+                                 (goto-char (point-min))
+                                 (when (search-forward-regexp "^\\(%[0-9]+\\):" nil t)
+                                   (match-string 1))))
+
   ;; A dummy process to keep comint happy. It will never get any input
   (unless (comint-check-proc (pm-base-buffer))
     ;; Was cat, but on non-Unix platforms that might not exist, so
@@ -630,8 +673,7 @@ Customized bindings may be defined in `lam-map', which currently contains:
   (let* ((active-worker
           (buffer-local-value 'lam-active-worker (pm-base-buffer))))
     (when (process-live-p active-worker)
-      (kill-process active-worker))
-    ))
+      (kill-process active-worker))))
 
 (defun lam-current-step ()
   "Return the current step information as a plist."
